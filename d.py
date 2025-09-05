@@ -1,10 +1,15 @@
+# d.py — финальный рабочий вариант: удаляет webhook и запускает polling
 import os
 import socks
+import urllib.request
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 from telethon import TelegramClient
 
-# --- Настройки бота ---
+# --- Настройки бота (берутся из переменных окружения Render) ---
 BOT_TOKEN = os.environ['BOT_TOKEN']
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
@@ -32,13 +37,10 @@ PROXIES = [
     ('193.122.123.43', 28080)
 ]
 
-# --- Команда /start ---
+# --- Функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Пришли мне номер телефона в формате +79998887766"
-    )
+    await update.message.reply_text("Привет! Пришли мне номер телефона в формате +79998887766")
 
-# --- Обработка номера телефона ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone_number = update.message.text.strip()
     if not phone_number.startswith("+") or not phone_number[1:].isdigit():
@@ -49,11 +51,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for idx, (ip, port) in enumerate(PROXIES, start=1):
         await update.message.reply_text(f"[{idx}] Используется прокси {ip}:{port}")
-
-        # Создаем Telethon клиент с SOCKS5 прокси
         proxy = (socks.SOCKS5, ip, port)
         client = TelegramClient(f'session_{idx}', API_ID, API_HASH, proxy=proxy)
-
         try:
             await client.connect()
             if not await client.is_user_authorized():
@@ -64,10 +63,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await client.disconnect()
 
-# --- Запуск бота ---
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# --- Удаляем webhook (если он был установлен) ---
+def delete_telegram_webhook():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = resp.read().decode(errors='ignore')
+            print("deleteWebhook response:", data)
+    except Exception as e:
+        print("Warning: deleteWebhook failed (may be fine):", e)
 
-print("Бот запущен...")
-app.run_polling()
+# --- Запуск приложения ---
+if __name__ == "__main__":
+    # 1) удалить webhook, чтобы не было конфликта
+    delete_telegram_webhook()
+
+    # 2) создать и запустить приложение (polling)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Бот запускается (polling)...")
+    app.run_polling()
