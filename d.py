@@ -1,8 +1,8 @@
 import os
+import socks
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telethon import TelegramClient
-import socks
 
 # --- Настройки бота ---
 BOT_TOKEN = os.environ['BOT_TOKEN']
@@ -50,6 +50,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, (ip, port) in enumerate(PROXIES, start=1):
         await update.message.reply_text(f"[{idx}] Используется прокси {ip}:{port}")
 
+        # Создаем Telethon клиент с SOCKS5 прокси
         proxy = (socks.SOCKS5, ip, port)
         client = TelegramClient(f'session_{idx}', API_ID, API_HASH, proxy=proxy)
 
