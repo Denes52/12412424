@@ -1,125 +1,143 @@
+# d.py — финальный код: проверка прокси, аккуратная работа с Telethon и сообщения в чат
 import os
-import time
-import urllib.request
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
-from telegram.error import Conflict
+import socket
 import socks
+import asyncio
+import traceback
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telethon import TelegramClient
 
-# --- Настройки бота (из Render env) ---
+# --- Конфиг через переменные окружения ---
 BOT_TOKEN = os.environ['BOT_TOKEN']
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 
-# --- Прокси ---
+# Прокси по умолчанию (ip, port). Заменяй на живые.
 PROXIES = [
     ('8.210.148.229', 1111),
     ('192.252.214.17', 4145),
     ('5.183.131.72', 1080),
     ('47.236.166.47', 1100),
     ('68.191.23.134', 9200),
-    ('103.127.223.126', 1080),
-    ('103.12.161.222', 1080),
-    ('103.118.175.165', 8199),
-    ('107.219.228.250', 7777),
-    ('184.170.251.30', 11288),
-    ('47.238.67.238', 1024),
-    ('8.219.119.119', 1024),
-    ('185.93.89.183', 15918),
-    ('165.22.110.253', 1080),
-    ('156.244.45.138', 33333),
-    ('198.177.253.13', 4145),
-    ('176.117.237.132', 1080),
-    ('8.218.104.176', 1100),
-    ('193.122.123.43', 28080)
+    # ...
 ]
 
-# --- handlers ---
+# Управление: если установить USE_PROXIES="false", работа будет без прокси
+USE_PROXIES = os.environ.get('USE_PROXIES', 'true').lower() not in ('0', 'false', 'no')
+# Таймаут TCP-проверки прокси (сек)
+PROXY_CHECK_TIMEOUT = float(os.environ.get('PROXY_CHECK_TIMEOUT', '3.0'))
+
+# --- Утилиты ---
+def is_tcp_open(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Быстрая проверка доступности TCP порта (фильтрует Connection refused)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+async def try_send_code_with_proxy(phone: str, ip: str, port: int, idx: int, update: Update):
+    """Создать Telethon клиент через прокси и отправить код (одна попытка)."""
+    # Telethon принимает proxy как (socks.SOCKS5, host, port, True/False, username, password)
+    proxy = (socks.SOCKS5, ip, port, True, None, None)
+    session_name = f"session_{idx}"
+    client = TelegramClient(session_name, API_ID, API_HASH, proxy=proxy)
+    try:
+        await client.connect()
+        # если уже авторизован — нет смысла слать код
+        if await client.is_user_authorized():
+            await update.message.reply_text(f"[{idx}] Сессия уже авторизована (session: {session_name}). Пропускаю.")
+            return True
+        await client.send_code_request(phone)
+        await update.message.reply_text(f"[{idx}] Код подтверждения отправлен на {phone} через {ip}:{port}")
+        return True
+    except Exception as e:
+        await update.message.reply_text(f"[{idx}] Ошибка при работе через {ip}:{port} — {e}")
+        return False
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+async def try_send_code_without_proxy(phone: str, idx: int, update: Update):
+    """Попытка отправить код без прокси (прямое подключение)."""
+    session_name = f"session_direct_{idx}"
+    client = TelegramClient(session_name, API_ID, API_HASH)
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            await update.message.reply_text(f"[direct {idx}] Сессия уже авторизована. Пропускаю.")
+            return True
+        await client.send_code_request(phone)
+        await update.message.reply_text(f"[direct {idx}] Код подтверждения отправлен на {phone} (без прокси)")
+        return True
+    except Exception as e:
+        await update.message.reply_text(f"[direct {idx}] Ошибка (без прокси): {e}")
+        return False
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+# --- Telegram handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Пришли номер в формате +79998887766")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone_number = update.message.text.strip()
-    if not phone_number.startswith("+") or not phone_number[1:].isdigit():
-        await update.message.reply_text("Неверный формат. Начни с + и цифр.")
+    phone = update.message.text.strip()
+    if not phone.startswith('+') or not phone[1:].isdigit():
+        await update.message.reply_text("Неверный формат номера. Начни с + и используй только цифры.")
         return
 
-    await update.message.reply_text(f"Запуск проверки {phone_number} через {len(PROXIES)} прокси...")
-    for idx, (ip, port) in enumerate(PROXIES, start=1):
-        await update.message.reply_text(f"[{idx}] Прокси {ip}:{port}")
-        proxy = (socks.SOCKS5, ip, port)
-        client = TelegramClient(f'session_{idx}', API_ID, API_HASH, proxy=proxy)
+    await update.message.reply_text(f"Запуск проверки номера {phone}. USE_PROXIES={USE_PROXIES}")
+
+    # если не используем прокси — одна попытка напрямую
+    if not USE_PROXIES:
+        ok = await try_send_code_without_proxy(phone, 1, update)
+        if not ok:
+            await update.message.reply_text("Попытка без прокси не удалась.")
+        return
+
+    # Идем по списку прокси, сначала фильтруем недоступные по TCP
+    alive = []
+    for ip, port in PROXIES:
+        await update.message.reply_text(f"Проверяю прокси {ip}:{port} ...")
+        if is_tcp_open(ip, port, timeout=PROXY_CHECK_TIMEOUT):
+            alive.append((ip, port))
+            await update.message.reply_text(f"Прокси {ip}:{port} — доступен (TCP).")
+        else:
+            await update.message.reply_text(f"Прокси {ip}:{port} — недоступен (TCP). Пропускаю.")
+
+    if not alive:
+        await update.message.reply_text("Нет доступных прокси. Установи рабочие прокси или выставь USE_PROXIES=false.")
+        return
+
+    # Пробуем по очереди через доступные прокси, пока не отправим код
+    for idx, (ip, port) in enumerate(alive, start=1):
+        await update.message.reply_text(f"[Попытка {idx}] Использую прокси {ip}:{port}")
         try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.send_code_request(phone_number)
-                await update.message.reply_text(f"[{idx}] Код подтверждения отправлен")
+            ok = await try_send_code_with_proxy(phone, ip, port, idx, update)
+            if ok:
+                return
         except Exception as e:
-            await update.message.reply_text(f"[{idx}] Ошибка: {e}")
-        finally:
-            await client.disconnect()
+            # на всякий — логируем полную трассировку в чат (коротко)
+            await update.message.reply_text(f"[{idx}] Неожиданная ошибка: {e}")
+            await update.message.reply_text("Подробности в логах сервера.")
+            print("Traceback:", traceback.format_exc())
 
-# --- webhook utilities ---
-def get_webhook_info():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
-    try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            return r.read().decode()
-    except Exception as e:
-        return f"getWebhookInfo failed: {e}"
+    # Если все прокси не сработали — пробуем один раз без прокси
+    await update.message.reply_text("Все прокси не сработали — пробую отправить без прокси.")
+    ok = await try_send_code_without_proxy(phone, 1, update)
+    if not ok:
+        await update.message.reply_text("Не удалось отправить код ни через прокси, ни напрямую. Проверь прокси или API_ID/API_HASH.")
 
-def delete_webhook():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
-    try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            return r.read().decode()
-    except Exception as e:
-        return f"deleteWebhook failed: {e}"
-
-# --- main ---
-def main():
-    # debug logs to help в логах Render
-    print("getWebhookInfo:", get_webhook_info())
-    print("deleteWebhook:", delete_webhook())
-
+# --- Запуск приложения ---
+if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    max_retries = 6
-    retry_delay = 5
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"Запуск polling (attempt {attempt}/{max_retries})...")
-            app.run_polling()
-            # Если app.run_polling() завершился без исключения — выходим
-            print("Polling остановлен нормально.")
-            break
-        except Conflict as c:
-            # конкретная обработка Conflict
-            print("Conflict exception:", c)
-            print("Попытка удалить webhook и перезапустить...")
-            print(delete_webhook())
-            time.sleep(retry_delay)
-            continue
-        except Exception as e:
-            # общая ошибка — логируем и повторяем при возможности
-            print("Polling error:", repr(e))
-            if "Conflict" in str(e):
-                print("Обнаружен конфликт в тексте ошибки, пробуем удалить webhook и перезапустить...")
-                print(delete_webhook())
-                time.sleep(retry_delay)
-                continue
-            # для других ошибок — повторяем пару раз, потом падаем
-            time.sleep(retry_delay)
-            continue
-    else:
-        print("Не удалось запустить polling после нескольких попыток. Проверьте, что нигде не запущен другой экземпляр бота или смените токен.")
-
-if __name__ == "__main__":
-    main()
+    print("Бот запущен. USE_PROXIES =", USE_PROXIES)
+    app.run_polling()
