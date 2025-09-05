@@ -1,4 +1,4 @@
-# d.py — финальная рабочая версия для Render (с исправлением event loop в потоке)
+# d.py — рабочая версия с улучшенной проверкой прокси и безопасным использованием Telethon
 import os
 import ssl
 import socks
@@ -15,10 +15,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 # ========== Настройки ==========
 PROXIES_FILE = "proxies.txt"
 OK_PROXIES_FILE = "ok_proxies.txt"
-TCP_TIMEOUT = 0.6
-SSL_TIMEOUT = 0.8
-WORKERS = 60
-MAX_SEND_PER_REQUEST = 50
+# увеличил таймауты — многие прокси медленные
+TCP_TIMEOUT = 2.0
+SSL_TIMEOUT = 3.0
+WORKERS = 40
+MAX_SEND_PER_REQUEST = 30
+SEND_CONCURRENCY = 6
+DELAY_BETWEEN_ATTEMPTS = 0.25
 # =============================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -37,8 +40,11 @@ def load_proxies(filename=PROXIES_FILE):
             s = line.strip()
             if not s:
                 continue
+            # допускаем строки вида socks5://ip:port или ip:port
             if s.startswith("socks5://"):
                 s = s[len("socks5://"):]
+            if s.startswith("socks4://"):
+                s = s[len("socks4://"):]
             if ":" not in s:
                 continue
             ip, port = s.split(":", 1)
@@ -49,13 +55,13 @@ def load_proxies(filename=PROXIES_FILE):
             proxies.append((ip.strip(), port))
     return proxies
 
-# --- синхронная проверка одного proxy: TCP + SSL handshake ---
+# --- синхронная проверка одного proxy: TCP + SSL handshake (попытка SOCKS5) ---
 def check_proxy_sync(ip: str, port: int, tcp_timeout=TCP_TIMEOUT, ssl_timeout=SSL_TIMEOUT) -> bool:
     s = socks.socksocket()
     try:
         s.set_proxy(socks.SOCKS5, ip, port, rdns=True)
         s.settimeout(tcp_timeout)
-        s.connect(("api.telegram.org", 443))
+        s.connect(("149.154.167.99", 443))  # IP Telegram, обходим DNS
     except Exception:
         try:
             s.close()
@@ -76,7 +82,7 @@ def check_proxy_sync(ip: str, port: int, tcp_timeout=TCP_TIMEOUT, ssl_timeout=SS
             pass
         return False
 
-# --- асинхронно фильтруем рабочие прокси быстро (параллельно) ---
+# --- асинхронно фильтруем рабочие прокси ---
 async def filter_working_proxies(proxies, workers=WORKERS):
     if not proxies:
         return []
@@ -108,7 +114,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     good = await filter_working_proxies(proxies)
-    # сохранить рабочие
     with open(OK_PROXIES_FILE, "w", encoding="utf-8") as f:
         for ip, port in good:
             f.write(f"{ip}:{port}\n")
@@ -116,8 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = 0
     to_try = good[:MAX_SEND_PER_REQUEST]
 
-    # Семафор чтобы не создавать слишком много одновременных сессий, если вы захотите параллелить
-    sem = asyncio.Semaphore(8)  # можно изменить при необходимости
+    sem = asyncio.Semaphore(SEND_CONCURRENCY)
 
     async def try_send_via_proxy(ip, port):
         nonlocal sent
@@ -125,22 +129,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = f"session_{ip.replace('.', '_')}_{port}"
         async with sem:
             try:
-                async with TelegramClient(session, API_ID, API_HASH, proxy=proxy) as client:
-                    try:
-                        if not await client.is_user_authorized():
-                            await client.send_code_request(phone)
+                # Создаём клиент, подключаемся явно (без интерактивного start())
+                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy)
+                await client.connect()
+                try:
+                    if not await client.is_user_authorized():
+                        # timeout на отправку code_request, чтобы не зависнуть
+                        try:
+                            await asyncio.wait_for(client.send_code_request(phone), timeout=12)
                             sent += 1
-                    except Exception as e_inner:
-                        # если по этому proxy не получилось отправить код — просто логируем и продолжаем
-                        print(f"[warn] send_code_request failed via {ip}:{port} -> {e_inner}")
+                            print(f"[ok] code_request через {ip}:{port}")
+                        except asyncio.TimeoutError:
+                            print(f"[warn] send_code_request timeout via {ip}:{port}")
+                        except Exception as e_inner:
+                            print(f"[warn] send_code_request failed via {ip}:{port}: {e_inner}")
+                finally:
+                    await client.disconnect()
             except Exception as e:
-                print(f"[warn] Не удалось подключиться Telethon через {ip}:{port}: {e}")
+                # логируем причину — поможет понять, что именно неверно с прокси
+                print(f"[warn] Не удалось подключиться Telethon через {ip}:{port}: {repr(e)}")
 
-    # Последовательно или параллельно? — делаем параллельно, но с семафором
-    tasks = [try_send_via_proxy(ip, port) for ip, port in to_try]
-    await asyncio.gather(*tasks)
+    tasks = []
+    for ip, port in to_try:
+        tasks.append(asyncio.create_task(try_send_via_proxy(ip, port)))
+        await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
 
-    await msg.edit_text(f"Готово. Рабочих прокси: {len(good)}. Кодов попытались отправить: {sent}.")
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    await msg.edit_text(f"Готово. Рабочих прокси: {len(good)}. Кодов отправлено (попыток): {sent}.")
 
 # --- создаём и запускаем бот ---
 def build_app():
@@ -161,28 +178,18 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 def ensure_event_loop():
-    """
-    В некоторых окружениях main запускается в отдельном потоке.
-    Перед вызовом app.run_polling() нужно создать event loop в текущем потоке, если его нет.
-    """
     try:
-        # если loop уже запущен в этом потоке — ничего не делаем
         asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
 def main():
-    # 1) стартуем Flask в фоне (daemon thread)
     t = threading.Thread(target=run_flask, daemon=True, name="flask_bg")
     t.start()
 
-    # 2) собираем приложение бота
     app = build_app()
-
-    # 3) Гарантируем event loop в текущем потоке (исправление ошибки)
     ensure_event_loop()
-
     try:
         print("Бот запускается (polling)...")
         app.run_polling()
