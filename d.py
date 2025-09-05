@@ -1,180 +1,142 @@
-# d.py — финальный: проверка прокси через SOCKS (соединение к api.telegram.org:443),
-# только потом передаём proxy в Telethon.
+# d.py — финальная версия
 import os
 import socket
-import socks
 import ssl
-import traceback
+import socks
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+from telethon import TelegramClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from telethon import TelegramClient
 
-BOT_TOKEN = os.environ['BOT_TOKEN']
-API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH']
+# --- Переменные окружения (на Render настроить BOT_TOKEN, API_ID, API_HASH) ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH")
 
-# Прокси: (ip, port)
-PROXIES = [
-    ('8.210.148.229', 1111),
-    ('192.252.214.17', 4145),
-    ('5.183.131.72', 1080),
-    ('47.236.166.47', 1100),
-    ('68.191.23.134', 9200),
-    # ... остальные
-]
+if not BOT_TOKEN or not API_ID or not API_HASH:
+    raise RuntimeError("Установите BOT_TOKEN, API_ID, API_HASH в переменных окружения")
 
-# Управление: если false — не используем прокси
-USE_PROXIES = os.environ.get('USE_PROXIES', 'true').lower() not in ('0', 'false', 'no')
-PROXY_CONNECT_TIMEOUT = float(os.environ.get('PROXY_CHECK_TIMEOUT', '4.0'))
+# --- Чтение прокси (парсит строки с или без префикса socks5://) ---
+def load_proxies(filename="proxies.txt"):
+    proxies = []
+    if not os.path.exists(filename):
+        return proxies
+    with open(filename, "r", encoding="utf-8") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s:
+                continue
+            # убрать возможный префикс
+            if s.startswith("socks5://"):
+                s = s[len("socks5://"):]
+            if s.startswith("http://"):
+                s = s[len("http://"):]
+            if ":" not in s:
+                continue
+            ip, port = s.split(":", 1)
+            try:
+                port = int(port)
+            except ValueError:
+                continue
+            proxies.append((ip.strip(), port))
+    return proxies
 
+PROXIES = load_proxies("proxies.txt")
 
-def test_proxy_to_host_socks5(ip: str, port: int, timeout: float = 4.0) -> (bool, str):
-    """
-    Попытка через SOCKS5 прокси подключиться к api.telegram.org:443.
-    Возвращает (True, '') если OK, иначе (False, 'причина').
-    Это реальный тест — если прокси не умеет проксировать TLS на внешний хост,
-    Telethon тоже не сможет работать через него.
-    """
+# --- Синхронная проверка одного SOCKS5-прокси: подключиться через proxy к api.telegram.org:443 и выполнить TLS handshake ---
+def check_proxy_sync(ip: str, port: int, timeout: float = 6.0) -> bool:
+    s = socks.socksocket()
+    s.set_proxy(socks.SOCKS5, ip, port, rdns=True)
+    s.settimeout(timeout)
     try:
-        s = socks.socksocket()
-        s.set_proxy(socks.SOCKS5, ip, port, rdns=True)  # rdns True
-        s.settimeout(timeout)
-        # Попытка установить TLS-соединение к api.telegram.org:443 через прокси
+        # подключаемся к telegram api через прокси
         s.connect(("api.telegram.org", 443))
-        # обернём в TLS-контекст и сделаем handshake (быстрая проверка)
+        # оборачиваем SSL и делаем рукопожатие (проверка сертификата)
         ctx = ssl.create_default_context()
-        ssl_sock = ctx.wrap_socket(s, server_hostname="api.telegram.org")
-        # небольшой recv чтобы убедиться, что handshake прошёл
-        ssl_sock.settimeout(2.0)
-        try:
-            ssl_sock.recv(1)
-        except socket.timeout:
-            # timeout recv — OK, значит handshake скорее всего успешен
-            pass
-        ssl_sock.close()
-        return True, ""
-    except Exception as e:
-        return False, repr(e)
-
-
-async def send_code_via_proxy(phone: str, ip: str, port: int, idx: int, update: Update) -> bool:
-    """
-    Попытка отправить код через Telethon, используя конкретный proxy.
-    Возвращает True если отправлено/успешно, False иначе.
-    Все исключения логируем.
-    """
-    proxy_tuple = (socks.SOCKS5, ip, port, True, None, None)
-    session = f"session_{idx}"
-    client = TelegramClient(session, API_ID, API_HASH, proxy=proxy_tuple)
-    try:
-        await client.connect()
-        if await client.is_user_authorized():
-            await update.message.reply_text(f"[{idx}] session {session} уже авторизована — пропускаю.")
-            return True
-        await client.send_code_request(phone)
-        await update.message.reply_text(f"[{idx}] Код подтверждения отправлен через {ip}:{port}")
+        ss = ctx.wrap_socket(s, server_hostname="api.telegram.org")
+        ss.do_handshake()
+        ss.close()
         return True
-    except Exception as e:
-        await update.message.reply_text(f"[{idx}] Ошибка Telethon через {ip}:{port}: {e}")
-        print(f"[{idx}] Telethon traceback:", traceback.format_exc())
-        return False
-    finally:
+    except Exception:
         try:
-            await client.disconnect()
+            s.close()
         except Exception:
             pass
-
-
-async def send_code_direct(phone: str, idx: int, update: Update) -> bool:
-    """Попытка отправить код напрямую (без прокси)."""
-    session = f"session_direct_{idx}"
-    client = TelegramClient(session, API_ID, API_HASH)
-    try:
-        await client.connect()
-        if await client.is_user_authorized():
-            await update.message.reply_text(f"[direct {idx}] session авторизована — пропускаю.")
-            return True
-        await client.send_code_request(phone)
-        await update.message.reply_text(f"[direct {idx}] Код подтверждения отправлен (без прокси).")
-        return True
-    except Exception as e:
-        await update.message.reply_text(f"[direct {idx}] Ошибка (без прокси): {e}")
-        print("[direct] traceback:", traceback.format_exc())
         return False
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
 
+# --- Асинхронно проверяем все прокси через ThreadPoolExecutor ---
+async def filter_working_proxies(proxies, workers=20):
+    loop = asyncio.get_running_loop()
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        tasks = [loop.run_in_executor(ex, check_proxy_sync, ip, port) for ip,port in proxies]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    good = []
+    for (ip,port), res in zip(proxies, results):
+        if isinstance(res, Exception):
+            # исключения считаем нерабочими
+            continue
+        if res:
+            good.append((ip, port))
+    return good
 
-# --- Telegram handlers ---
+# --- Телеграм-бот: minimal output. Пришли номер, бот проверит прокси, запишет ok_proxies.txt и отправит итог ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Пришли номер в формате +79998887766")
-
+    await update.message.reply_text("Пришли номер в формате +79998887766")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not phone.startswith("+") or not phone[1:].isdigit():
-        await update.message.reply_text("Неверный формат. Начни с + и цифр.")
+        await update.message.reply_text("Неверный формат. Пример: +79998887766")
         return
 
-    await update.message.reply_text(f"Запуск проверки {phone}. USE_PROXIES={USE_PROXIES}")
+    # короткое уведомление пользователю, потом финал
+    await update.message.reply_text("Запрос принят — проверяю прокси и отправляю коды...")
 
-    if not USE_PROXIES:
-        ok = await send_code_direct(phone, 1, update)
-        if not ok:
-            await update.message.reply_text("Не удалось отправить код напрямую — проверь API_ID/API_HASH.")
-        return
+    # проверяем прокси (параллельно)
+    good = await filter_working_proxies(PROXIES, workers=20)
 
-    # 1) Быстрая TCP-проверка (create_connection)
-    alive_tcp = []
-    for ip, port in PROXIES:
-        await update.message.reply_text(f"Проверяю TCP {ip}:{port} ...")
+    # сохраняем рабочие прокси
+    with open("ok_proxies.txt", "w", encoding="utf-8") as f:
+        for ip, port in good:
+            f.write(f"{ip}:{port}\n")
+
+    sent_count = 0
+    # последовательно пробуем отправлять код через каждый рабочий прокси
+    for idx, (ip, port) in enumerate(good, start=1):
+        proxy = (socks.SOCKS5, ip, port)
+        session_name = f"session_{idx}"
+        client = TelegramClient(session_name, API_ID, API_HASH, proxy=proxy)
         try:
-            with socket.create_connection((ip, port), timeout=2.0):
-                alive_tcp.append((ip, port))
-                await update.message.reply_text(f"TCP OK: {ip}:{port}")
+            await client.connect()
+            # если сессия уже авторизована, считаем как успешный (но не нужно отправлять код)
+            if await client.is_user_authorized():
+                sent_count += 1
+            else:
+                # отправляем код подтверждения
+                await client.send_code_request(phone)
+                sent_count += 1
         except Exception:
-            await update.message.reply_text(f"TCP недоступен: {ip}:{port} — пропускаю")
+            # пропускаем проблемный прокси
+            pass
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
-    if not alive_tcp:
-        await update.message.reply_text("Нет прокси с доступным TCP. Установи рабочие прокси или USE_PROXIES=false.")
-        return
+    # финальный ответ — только цифры и файл
+    await update.message.reply_text(f"Готово ✅ Рабочих прокси: {len(good)}. Запросов кода отправлено: {sent_count}.")
 
-    # 2) Тестируем реальную проксировку к Telegram через SOCKS5
-    alive_real = []
-    for ip, port in alive_tcp:
-        await update.message.reply_text(f"Тестирую SOCKS5-проксирование {ip}:{port} -> api.telegram.org:443 ...")
-        ok, reason = test_proxy_to_host_socks5(ip, port, timeout=PROXY_CONNECT_TIMEOUT)
-        if ok:
-            alive_real.append((ip, port))
-            await update.message.reply_text(f"Прокси реально проксирует: {ip}:{port}")
-        else:
-            await update.message.reply_text(f"Прокси НЕ проксирует к Telegram: {ip}:{port}  причина: {reason}")
-
-    if not alive_real:
-        await update.message.reply_text("Не найдено прокси, которые проксируют к Telegram. Попробуй установить USE_PROXIES=false или добавить другие прокси.")
-        return
-
-    # 3) Пытаемся отправить код через реальные прокси по очереди
-    for idx, (ip, port) in enumerate(alive_real, start=1):
-        await update.message.reply_text(f"[Попытка {idx}] Использую прокси {ip}:{port}")
-        ok = await send_code_via_proxy(phone, ip, port, idx, update)
-        if ok:
-            return
-
-    # 4) Если все не удалось, пробуем зайти напрямую в конце
-    await update.message.reply_text("Все прокси не сработали — пробую напрямую.")
-    ok = await send_code_direct(phone, 1, update)
-    if not ok:
-        await update.message.reply_text("Не удалось отправить код ни через прокси, ни напрямую. Проверь API_ID/API_HASH и прокси.")
-
-# --- Запуск ---
-if __name__ == "__main__":
+# --- Запуск бота ---
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен. USE_PROXIES =", USE_PROXIES)
+    print("Бот запущен (polling)...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
