@@ -1,14 +1,13 @@
 import os
-import asyncio
-import socks
-from telethon import TelegramClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telethon import TelegramClient
+import socks
 
 # --- Настройки бота ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.environ['BOT_TOKEN']
+API_ID = int(os.environ['API_ID'])
+API_HASH = os.environ['API_HASH']
 
 # --- Список прокси (ip, port) ---
 PROXIES = [
@@ -51,12 +50,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, (ip, port) in enumerate(PROXIES, start=1):
         await update.message.reply_text(f"[{idx}] Используется прокси {ip}:{port}")
 
-        # Создаем Telethon клиент с SOCKS5 прокси
         proxy = (socks.SOCKS5, ip, port)
         client = TelegramClient(f'session_{idx}', API_ID, API_HASH, proxy=proxy)
 
         try:
-            await client.start()
+            await client.connect()
             if not await client.is_user_authorized():
                 await client.send_code_request(phone_number)
                 await update.message.reply_text(f"[{idx}] Код подтверждения отправлен на {phone_number}")
@@ -66,13 +64,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await client.disconnect()
 
 # --- Запуск бота ---
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Бот запущен...")
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+print("Бот запущен...")
+app.run_polling()
