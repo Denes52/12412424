@@ -2,3 +2,4 @@ python-telegram-bot==20.3
 telethon==1.25.1
 PySocks==1.7.1
 Flask
+gunicorn
