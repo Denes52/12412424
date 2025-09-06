@@ -83,10 +83,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
                 except asyncio.TimeoutError:
-                    print(f"[timeout] client.connect() через {ip}:{port}")
+                    print(f"[timeout] connect {ip}:{port}")
                     return
                 except Exception as e:
-                    print(f"[warn] connect failed {ip}:{port}: {repr(e)}")
+                    print(f"[warn] connect fail {ip}:{port}: {repr(e)}")
                     return
 
                 try:
@@ -100,13 +100,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         sent += 1
                         ok_list.append(f"{ip}:{port}")
                         print(f"[ok] send_code_request via {ip}:{port}")
-                    except asyncio.TimeoutError:
-                        print(f"[timeout] send_code_request via {ip}:{port}")
                     except Exception as e_inner:
-                        print(f"[warn] send_code_request failed via {ip}:{port}: {repr(e_inner)}")
+                        print(f"[warn] send_code_request fail {ip}:{port}: {repr(e_inner)}")
+
                 await client.disconnect()
             except Exception as e_outer:
-                print(f"[warn] Ошибка Telethon через {ip}:{port}: {repr(e_outer)}")
+                print(f"[warn] telethon error {ip}:{port}: {repr(e_outer)}")
 
     tasks = []
     for ip, port in to_try:
@@ -142,12 +141,19 @@ def run_flask():
 
 async def runner():
     bot = build_app()
-    # ⚡ важно: run_polling вызываем как task, без stop_signals
-    await bot.run_polling(stop_signals=None, close_loop=False)
+    print("Бот запускается (polling)...")
+    # запускаем polling без stop_signals
+    await bot.initialize()
+    await bot.start()
+    await bot.updater.start_polling()
+    # держим цикл
+    await asyncio.Event().wait()
 
 def main():
-    t = threading.Thread(target=run_flask, daemon=True, name="flask_bg")
+    # Flask в отдельном потоке
+    t = threading.Thread(target=run_flask, daemon=True)
     t.start()
+    # Telegram-бот в asyncio главном цикле
     asyncio.run(runner())
 
 if __name__ == "__main__":
