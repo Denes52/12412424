@@ -129,7 +129,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"Готово. Попыток отправки кода: {sent}. Успешные прокси: {len(ok_list)}.")
 
-def build_app():
+def build_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -142,17 +142,16 @@ flask_app = Flask(__name__)
 def index():
     return "OK", 200
 
-# Запуск бота в отдельном event loop
-def run_bot():
+# запускаем бота в фоне, но в том же event loop, без закрытия лупа
+def start_bot_background():
     async def runner():
-        app = build_app()
+        bot = build_bot()
         print("Бот запускается (polling)...")
-        # важно: отключаем сигналы, чтобы можно было запускать в thread
-        await app.run_polling(stop_signals=None)
+        await bot.run_polling(stop_signals=None, close_loop=False)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(runner())
+    loop.create_task(runner())
+    loop.run_forever()
 
-# gunicorn вызывает flask_app, а бот поднимается в фоне
-threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=start_bot_background, daemon=True).start()
