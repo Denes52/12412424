@@ -143,11 +143,16 @@ flask_app = Flask(__name__)
 def index():
     return "OK", 200
 
+# Запуск бота в отдельном event loop
 def run_bot():
-    app = build_app()
-    print("Бот запускается (polling)...")
-    app.run_polling()
+    async def runner():
+        app = build_app()
+        print("Бот запускается (polling)...")
+        await app.run_polling()
 
-# При старте через gunicorn будет вызван flask_app
-# А бот запускаем в фоне
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner())
+
+# gunicorn вызывает flask_app, а бот поднимается в фоне
 threading.Thread(target=run_bot, daemon=True).start()
