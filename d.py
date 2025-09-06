@@ -7,7 +7,6 @@ from flask import Flask
 from telethon import TelegramClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import time
 
 # ====== Конфиг ======
 PROXIES_FILE = "proxies.txt"
@@ -148,7 +147,8 @@ def run_bot():
     async def runner():
         app = build_app()
         print("Бот запускается (polling)...")
-        await app.run_polling()
+        # важно: отключаем сигналы, чтобы можно было запускать в thread
+        await app.run_polling(stop_signals=None)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
