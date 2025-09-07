@@ -1,154 +1,90 @@
 import os
-import ssl
-import socks
 import asyncio
-import threading
 from flask import Flask
-from telethon import TelegramClient
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, PhoneNumberInvalidError, PhoneCodeInvalidError
 
-# ====== Конфиг ======
+# ================== Flask (для Render) ==================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Bot is running!"
+
+# ================== Настройки ==================
+API_ID = int(os.getenv("API_ID", "27503668"))
+API_HASH = os.getenv("API_HASH", "f654d14ed2b963765ba629d1352dacf5")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "6979600675:AAGr5-ZupwSvgeWC8IWtG-PTgBg50ZxoaEo")
+USE_PROXIES = os.getenv("USE_PROXIES", "true").lower() == "true"
+
 PROXIES_FILE = "proxies.txt"
 OK_PROXIES_FILE = "ok_proxies.txt"
 
-CONNECT_TIMEOUT = 20.0
-SEND_CODE_TIMEOUT = 20.0
-IS_AUTH_TIMEOUT = 6.0
-MAX_SEND_PER_REQUEST = 25
-SEND_CONCURRENCY = 3
-DELAY_BETWEEN_TASKS = 0.25
+# ================== Функция проверки прокси ==================
+async def try_proxy(phone_number: str, proxy: tuple) -> bool:
+    print(f"🔌 Пробую прокси {proxy[0]}:{proxy[1]}")
+    client = TelegramClient("check_session", API_ID, API_HASH, proxy=("socks5", proxy[0], proxy[1]))
 
-# Твой токен и API
-BOT_TOKEN = "6979600675:AAEybjvDpGB5DK_6DQ0kvpdLMODaTxAYML4"
-API_ID = int(os.environ.get("API_ID") or 0)
-API_HASH = os.environ.get("API_HASH")
-
-if not BOT_TOKEN or not API_ID or not API_HASH:
-    raise RuntimeError("Установите переменные окружения BOT_TOKEN, API_ID, API_HASH")
-
-# === Proxy helpers ===
-def parse_proxy_line(line: str):
-    parts = line.strip().split(":")
-    if len(parts) < 2:
-        return None
-    ip = parts[0].strip()
     try:
-        port = int(parts[1].strip())
-    except:
-        return None
-    return (ip, port)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.send_code_request(phone_number)
+            print(f"📲 Отправляю код на {phone_number}...")
+        await client.disconnect()
 
-def load_proxies(filename=PROXIES_FILE):
-    proxies = []
-    if not os.path.exists(filename):
-        return proxies
-    with open(filename, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            p = parse_proxy_line(s)
-            if p:
-                proxies.append(p)
-    return proxies
+        with open(OK_PROXIES_FILE, "a") as f:
+            f.write(f"{proxy[0]}:{proxy[1]}\n")
 
-# === Telegram bot handlers ===
+        print("✅ Прокси успешно!")
+        return True
+    except FloodWaitError as e:
+        print(f"⏳ FloodWait {e.seconds} сек")
+    except PhoneNumberInvalidError:
+        print("❌ Неверный номер")
+    except PhoneCodeInvalidError:
+        print("❌ Неверный код")
+    except Exception as e:
+        print(f"❌ Ошибка прокси {proxy}: {e}")
+    finally:
+        await client.disconnect()
+    return False
+
+# ================== Хэндлеры бота ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Пришлите номер в формате +79998887766")
+    await update.message.reply_text("Привет! Отправь номер телефона в формате +79998887766")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    if not phone.startswith("+") or not phone[1:].isdigit():
-        await update.message.reply_text("Неверный формат. Пример: +79998887766")
+    phone_number = update.message.text.strip()
+    await update.message.reply_text(f"🔍 Проверяю прокси для {phone_number}...")
+
+    if not os.path.exists(PROXIES_FILE):
+        await update.message.reply_text("❌ Файл proxies.txt не найден.")
         return
 
-    msg = await update.message.reply_text("Принял. Сразу начинаю попытки через указанные прокси...")
-    proxies = load_proxies(PROXIES_FILE)
-    if not proxies:
-        await msg.edit_text("Нет прокси в файле proxies.txt")
-        return
+    with open(PROXIES_FILE, "r") as f:
+        proxies = [line.strip().split(":") for line in f if line.strip()]
 
-    to_try = proxies[:MAX_SEND_PER_REQUEST]
-    sent = 0
-    sem = asyncio.Semaphore(SEND_CONCURRENCY)
-    ok_list = []
+    for host, port in proxies:
+        ok = await try_proxy(phone_number, (host, int(port)))
+        if ok:
+            await update.message.reply_text(f"✅ Код отправлен на {phone_number} через {host}:{port}")
+            return
 
-    async def try_send_via_proxy(ip, port):
-        nonlocal sent
-        proxy = (socks.SOCKS5, ip, port)
-        session = f"session_{ip.replace('.', '_')}_{port}"
-        async with sem:
-            try:
-                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy)
-                try:
-                    await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
-                except asyncio.TimeoutError:
-                    print(f"[timeout] connect {ip}:{port}")
-                    return
-                except Exception as e:
-                    print(f"[warn] connect fail {ip}:{port}: {repr(e)}")
-                    return
+    await update.message.reply_text("❌ Не удалось отправить код через все прокси.")
 
-                try:
-                    is_auth = await asyncio.wait_for(client.is_user_authorized(), timeout=IS_AUTH_TIMEOUT)
-                except Exception:
-                    is_auth = False
-
-                if not is_auth:
-                    try:
-                        await asyncio.wait_for(client.send_code_request(phone), timeout=SEND_CODE_TIMEOUT)
-                        sent += 1
-                        ok_list.append(f"{ip}:{port}")
-                        print(f"[ok] send_code_request via {ip}:{port}")
-                    except Exception as e_inner:
-                        print(f"[warn] send_code_request fail {ip}:{port}: {repr(e_inner)}")
-
-                await client.disconnect()
-            except Exception as e_outer:
-                print(f"[warn] telethon error {ip}:{port}: {repr(e_outer)}")
-
-    tasks = []
-    for ip, port in to_try:
-        tasks.append(asyncio.create_task(try_send_via_proxy(ip, port)))
-        await asyncio.sleep(DELAY_BETWEEN_TASKS)
-
-    if tasks:
-        await asyncio.gather(*tasks)
-
-    if ok_list:
-        with open(OK_PROXIES_FILE, "w", encoding="utf-8") as f:
-            for line in ok_list:
-                f.write(line + "\n")
-
-    await msg.edit_text(f"Готово. Попыток отправки кода: {sent}. Успешные прокси: {len(ok_list)}.")
-
-def build_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    return app
-
-# === Flask health endpoint ===
-flask_app = Flask(__name__)
-
-@flask_app.route("/", methods=["GET"])
-def index():
-    return "OK", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
-
-# === Main entry ===
+# ================== Запуск ==================
 def main():
-    # Flask в отдельном потоке
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Telegram Bot
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Бот запускается в главном потоке
-    bot = build_bot()
-    print("🚀 Бот запускается (polling)...")
-    bot.run_polling()
+    # Запуск Flask + Bot
+    import threading
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000)).start()
+    app_bot.run_polling()
 
 if __name__ == "__main__":
     main()
