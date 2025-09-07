@@ -7,7 +7,6 @@ from flask import Flask
 from telethon import TelegramClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import time
 
 # ====== Конфиг ======
 PROXIES_FILE = "proxies.txt"
@@ -124,7 +123,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"Готово. Попыток отправки кода: {sent}. Успешные прокси: {len(ok_list)}.")
 
-def build_app():
+def build_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -141,25 +140,15 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
 
-# === Telegram bot runner ===
-def run_bot():
-    async def main():
-        bot = build_app()
-        print("🚀 Бот запускается (polling)...")
-        await bot.run_polling(close_loop=False)
-    asyncio.run(main())
-
 # === Main entry ===
 def main():
     # Flask в отдельном потоке
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # Бот в отдельном потоке
-    t2 = threading.Thread(target=run_bot, daemon=True)
-    t2.start()
-
-    t2.join()
+    # Бот запускается в главном потоке
+    bot = build_bot()
+    print("🚀 Бот запускается (polling)...")
+    bot.run_polling()
 
 if __name__ == "__main__":
     main()
