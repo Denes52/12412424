@@ -14,11 +14,7 @@ def home():
     return "✅ Bot is running!"
 
 # ================== Настройки ==================
-API_ID = int(os.getenv("API_ID", "27503668"))
-API_HASH = os.getenv("API_HASH", "f654d14ed2b963765ba629d1352dacf5")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "6979600675:AAGr5-ZupwSvgeWC8IWtG-PTgBg50ZxoaEo")
-USE_PROXIES = os.getenv("USE_PROXIES", "true").lower() == "true"
-
+джлджлдж
 PROXIES_FILE = "proxies.txt"
 OK_PROXIES_FILE = "ok_proxies.txt"
 
