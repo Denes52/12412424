@@ -20,13 +20,15 @@ MAX_SEND_PER_REQUEST = 25
 SEND_CONCURRENCY = 3
 DELAY_BETWEEN_TASKS = 0.25
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# Твой токен и API
+BOT_TOKEN = "6979600675:AAEybjvDpGB5DK_6DQ0kvpdLMODaTxAYML4"
 API_ID = int(os.environ.get("API_ID") or 0)
 API_HASH = os.environ.get("API_HASH")
 
 if not BOT_TOKEN or not API_ID or not API_HASH:
     raise RuntimeError("Установите переменные окружения BOT_TOKEN, API_ID, API_HASH")
 
+# === Proxy helpers ===
 def parse_proxy_line(line: str):
     parts = line.strip().split(":")
     if len(parts) < 2:
@@ -52,7 +54,7 @@ def load_proxies(filename=PROXIES_FILE):
                 proxies.append(p)
     return proxies
 
-# Handlers
+# === Telegram bot handlers ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пришлите номер в формате +79998887766")
 
@@ -128,7 +130,7 @@ def build_app():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
-# Flask health endpoint
+# === Flask health endpoint ===
 flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET"])
@@ -139,22 +141,25 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
 
-async def runner():
-    bot = build_app()
-    print("Бот запускается (polling)...")
-    # запускаем polling без stop_signals
-    await bot.initialize()
-    await bot.start()
-    await bot.updater.start_polling()
-    # держим цикл
-    await asyncio.Event().wait()
+# === Telegram bot runner ===
+def run_bot():
+    async def main():
+        bot = build_app()
+        print("🚀 Бот запускается (polling)...")
+        await bot.run_polling(close_loop=False)
+    asyncio.run(main())
 
+# === Main entry ===
 def main():
     # Flask в отдельном потоке
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    # Telegram-бот в asyncio главном цикле
-    asyncio.run(runner())
+
+    # Бот в отдельном потоке
+    t2 = threading.Thread(target=run_bot, daemon=True)
+    t2.start()
+
+    t2.join()
 
 if __name__ == "__main__":
     main()
