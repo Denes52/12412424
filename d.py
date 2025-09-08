@@ -13,8 +13,12 @@ app = Flask(__name__)
 def home():
     return "✅ Bot is running!"
 
-# ================== Настройки ==================
-джлджлдж
+# ================== Настройки из переменных окружения ==================
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+USE_PROXIES = os.getenv("USE_PROXIES", "true").lower() == "true"
+
 PROXIES_FILE = "proxies.txt"
 OK_PROXIES_FILE = "ok_proxies.txt"
 
